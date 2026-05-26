@@ -1,0 +1,649 @@
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'dart:math' as math;
+import 'package:provider/provider.dart';
+import '../services/bluetooth_service.dart';
+import '../services/user_service.dart';
+import '../theme/mechanical_theme.dart';
+import '../widgets/smoke_background.dart';
+import '../widgets/heating_device_animation.dart';
+import 'custom_heat.dart';
+import 'userHeat_page.dart';
+import 'setting_page.dart';
+import 'wifi_page.dart';
+import 'cloud_devices_page.dart';
+import 'set_side_page.dart';
+import 'device_info_page.dart';
+
+/// 主页 - 机械风重新设计
+class MainPage extends StatefulWidget {
+  const MainPage({super.key});
+
+  @override
+  State<MainPage> createState() => _MainPageState();
+}
+
+class _MainPageState extends State<MainPage> {
+  int _selectedIndex = 0;
+  late PageController _pageController;
+  int? _lastSyncedPreset;
+  bool _isProgrammaticScroll = false;
+
+  @override
+  void initState() {
+    super.initState();
+    const int totalOptions = 6;
+    _pageController = PageController(
+      initialPage: 500 * totalOptions + _selectedIndex,
+    );
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  void _onOptionTap(int index) {
+    setState(() {
+      _selectedIndex = index;
+    });
+
+    if (index == 0) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => const CustomHeatPage()),
+      );
+    } else if (index >= 1 && index <= 5) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => UserHeatPage(optionIndex: index)),
+      );
+    }
+
+    print('Selected option: $index');
+  }
+
+  void _onStartHeating() async {
+    print('Start Heating button clicked, current: $_selectedIndex');
+
+    final bluetoothService = Provider.of<BluetoothService>(context, listen: false);
+    final deviceInfo = bluetoothService.deviceInfo;
+
+    final lightMode = deviceInfo?['lightMode'] as int? ?? 0;
+    final setTemp = deviceInfo?['setTemp'] as int? ?? 60;
+    final setTime = deviceInfo?['setTime'] as int? ?? 30;
+    final boostCount = deviceInfo?['boostCount'] as int? ?? 0;
+    final motorLevel = deviceInfo?['motorLevel'] as int? ?? 0;
+    final audioSwitch = deviceInfo?['audioSwitch'] as int? ?? 0;
+    final tempUnit = deviceInfo?['tempUnit'] as int? ?? 0;
+
+    try {
+      await bluetoothService.sendDeviceParameter(
+        lightMode,
+        setTemp,
+        setTime,
+        heatPreset: _selectedIndex,
+        startHeating: 1,
+        boostCount: boostCount,
+        motorLevel: motorLevel,
+        audioSwitch: audioSwitch,
+        tempUnit: tempUnit,
+      );
+      print('Main Page - Start Heating command sent, heatPreset=$_selectedIndex');
+
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (context) => const CustomHeatPage()),
+      );
+    } catch (e) {
+      print('Main Page - Failed to send Start Heating command: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to start heating: $e'),
+          backgroundColor: MechanicalTheme.warningRed,
+        ),
+      );
+    }
+  }
+
+  Future<void> _sendHeatPresetUpdate(int heatPreset) async {
+    final bluetoothService = Provider.of<BluetoothService>(context, listen: false);
+    final deviceInfo = bluetoothService.deviceInfo;
+
+    final lightMode = deviceInfo?['lightMode'] as int? ?? 0;
+    final setTemp = deviceInfo?['setTemp'] as int? ?? 60;
+    final setTime = deviceInfo?['setTime'] as int? ?? 30;
+    final startHeating = deviceInfo?['startHeating'] as int? ?? 0;
+    final boostCount = deviceInfo?['boostCount'] as int? ?? 0;
+    final motorLevel = deviceInfo?['motorLevel'] as int? ?? 0;
+    final audioSwitch = deviceInfo?['audioSwitch'] as int? ?? 0;
+    final tempUnit = deviceInfo?['tempUnit'] as int? ?? 0;
+
+    try {
+      await bluetoothService.sendDeviceParameter(
+        lightMode,
+        setTemp,
+        setTime,
+        heatPreset: heatPreset,
+        startHeating: startHeating,
+        boostCount: boostCount,
+        motorLevel: motorLevel,
+        audioSwitch: audioSwitch,
+        tempUnit: tempUnit,
+      );
+      _lastSyncedPreset = heatPreset;
+      print('Main Page - heatPreset update sent: $heatPreset');
+    } catch (e) {
+      print('Main Page - Failed to send heatPreset update: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SmokeBackground(
+      smokeColor: const Color(0xFF3DD6F5),
+      particleCount: 10,
+      child: Scaffold(
+        backgroundColor: Colors.transparent,
+        body: SafeArea(
+          child: Stack(
+            children: [
+              // 顶部按钮区域
+              _buildTopButtons(),
+
+              // 主要内容
+              Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  // 设备名称
+                  _buildDeviceName(),
+
+                  const SizedBox(height: 30),
+
+                  // 滚动选择器
+                  _buildScrollSelector(),
+
+                  const SizedBox(height: 50),
+
+                  // Start Heating 按钮
+                  _buildStartHeatingButton(),
+
+                  const SizedBox(height: 20),
+
+                  // Set Side 按钮
+                  _buildSetSideButton(),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTopButtons() {
+    return Positioned(
+      top: 0,
+      left: 0,
+      right: 0,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Row(
+          children: [
+            // WiFi 按钮
+            GestureDetector(
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const WifiPage()),
+                );
+              },
+              child: Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: MechanicalTheme.bgLight.withOpacity(0.5),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: MechanicalTheme.primaryCyan.withOpacity(0.3),
+                    width: 1,
+                  ),
+                ),
+                child: const Icon(
+                  Icons.wifi,
+                  color: MechanicalTheme.primaryCyan,
+                  size: 22,
+                ),
+              ),
+            ),
+            // Cloud 按钮
+            Expanded(
+              child: Center(
+                child: GestureDetector(
+                  onTap: () {
+                    final userService = Provider.of<UserService>(context, listen: false);
+                    if (!userService.isLoggedIn) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Please login first for cloud control'),
+                          backgroundColor: Colors.orange,
+                        ),
+                      );
+                      return;
+                    }
+
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => const CloudDevicesPage()),
+                    );
+                  },
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: MechanicalTheme.primaryCyan.withOpacity(0.15),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: MechanicalTheme.primaryCyan.withOpacity(0.5),
+                        width: 1.5,
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.cloud,
+                          color: MechanicalTheme.primaryCyan,
+                          size: 18,
+                        ),
+                        const SizedBox(width: 6),
+                        const Text(
+                          'Cloud Control',
+                          style: TextStyle(
+                            color: MechanicalTheme.primaryCyan,
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            // Info 按钮
+            GestureDetector(
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const DeviceInfoPage()),
+                );
+              },
+              child: Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: MechanicalTheme.bgLight.withOpacity(0.5),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: MechanicalTheme.warningYellow.withOpacity(0.3),
+                    width: 1,
+                  ),
+                ),
+                child: const Icon(
+                  Icons.info_outline,
+                  color: MechanicalTheme.warningYellow,
+                  size: 22,
+                ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            // 设置按钮
+            GestureDetector(
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (context) => const SettingPage()),
+                );
+              },
+              child: Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  color: MechanicalTheme.bgLight.withOpacity(0.5),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(
+                    color: MechanicalTheme.primaryCyan.withOpacity(0.3),
+                    width: 1,
+                  ),
+                ),
+                child: const Icon(
+                  Icons.settings,
+                  color: MechanicalTheme.primaryCyan,
+                  size: 22,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeviceName() {
+    return Consumer<BluetoothService>(
+      builder: (context, bleService, child) {
+        String deviceName = 'Select Option';
+        if (bleService.connectedDevice != null) {
+          if (kIsWeb) {
+            deviceName = 'Connected Device';
+          } else {
+            final name = bleService.connectedDevice.platformName;
+            deviceName = name.isNotEmpty ? name : 'Unknown Device';
+          }
+        }
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+          decoration: BoxDecoration(
+            color: MechanicalTheme.bgLight.withOpacity(0.3),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: MechanicalTheme.primaryCyan.withOpacity(0.3),
+              width: 1,
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: bleService.connectedDevice != null
+                      ? MechanicalTheme.coolGreen
+                      : MechanicalTheme.textDisabled,
+                  shape: BoxShape.circle,
+                  boxShadow: bleService.connectedDevice != null
+                      ? MechanicalTheme.createGlowShadow(MechanicalTheme.coolGreen, intensity: 0.6)
+                      : [],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                deviceName,
+                style: const TextStyle(
+                  color: MechanicalTheme.textPrimary,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1,
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildScrollSelector() {
+    return Consumer<BluetoothService>(
+      builder: (context, bleService, child) {
+        const double itemSize = 130.0;
+        const int totalOptions = 6;
+
+        final deviceInfo = bleService.deviceInfo;
+        if (deviceInfo != null) {
+          final devicePreset = deviceInfo['heatPreset'] as int?;
+          if (devicePreset != null &&
+              devicePreset >= 0 &&
+              devicePreset <= 5 &&
+              devicePreset != _lastSyncedPreset &&
+              devicePreset != _selectedIndex) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted && _pageController.hasClients) {
+                _isProgrammaticScroll = true;
+                final targetPage = 500 * totalOptions + devicePreset;
+                _pageController.jumpToPage(targetPage);
+                setState(() {
+                  _selectedIndex = devicePreset;
+                  _lastSyncedPreset = devicePreset;
+                });
+                print('Main Page - Synced scroll to device preset: $devicePreset');
+              }
+            });
+          }
+        }
+
+        return SizedBox(
+          height: 200,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              // 背景机械环装饰
+              CustomPaint(
+                size: const Size(200, 200),
+                painter: _SelectorRingPainter(
+                  color: MechanicalTheme.primaryCyan.withOpacity(0.3),
+                ),
+              ),
+              PageView.builder(
+                controller: _pageController,
+                onPageChanged: (page) {
+                  final centerIndex = page % totalOptions;
+                  if (_selectedIndex != centerIndex) {
+                    setState(() {
+                      _selectedIndex = centerIndex;
+                    });
+
+                    if (!_isProgrammaticScroll) {
+                      _sendHeatPresetUpdate(centerIndex);
+                    } else {
+                      _isProgrammaticScroll = false;
+                    }
+                  }
+                },
+                itemBuilder: (context, virtualIndex) {
+                  final index = virtualIndex % totalOptions;
+                  final isSelected = _selectedIndex == index;
+
+                  String imagePath;
+                  if (index == 0 || index == 3) {
+                    imagePath = 'assets/images/035.png';
+                  } else if (index == 1 || index == 4) {
+                    imagePath = 'assets/images/036.png';
+                  } else {
+                    imagePath = 'assets/images/037.png';
+                  }
+
+                  String displayText = '$index';
+                  if (index > 0) {
+                    int btIndex = index - 1;
+                    if (bleService.optionNames.containsKey(btIndex)) {
+                      displayText = bleService.optionNames[btIndex]!;
+                    }
+                  }
+
+                  return GestureDetector(
+                    onTap: () => _onOptionTap(index),
+                    child: Center(
+                      child: AnimatedScale(
+                        scale: isSelected ? 1.25 : 1.0,
+                        duration: const Duration(milliseconds: 300),
+                        curve: Curves.easeOutCubic,
+                        child: SizedBox(
+                          width: itemSize,
+                          height: itemSize,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              // 机械风外框
+                              Container(
+                                width: itemSize,
+                                height: itemSize,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  border: Border.all(
+                                    color: isSelected
+                                        ? MechanicalTheme.primaryCyan
+                                        : MechanicalTheme.primaryCyan.withOpacity(0.2),
+                                    width: isSelected ? 3 : 1.5,
+                                  ),
+                                  boxShadow: isSelected
+                                      ? MechanicalTheme.createGlowShadow(MechanicalTheme.primaryCyan)
+                                      : [],
+                                ),
+                              ),
+                              // PNG 图片
+                              Image.asset(
+                                imagePath,
+                                width: itemSize * 0.85,
+                                height: itemSize * 0.85,
+                                fit: BoxFit.contain,
+                              ),
+                              // 文本标签
+                              Text(
+                                displayText,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: displayText.length > 3 ? 16 : 22,
+                                  fontWeight: FontWeight.bold,
+                                  shadows: [
+                                    Shadow(
+                                      color: MechanicalTheme.primaryCyan.withOpacity(0.8),
+                                      blurRadius: 10,
+                                      offset: const Offset(0, 2),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildStartHeatingButton() {
+    return GestureDetector(
+      onTap: _onStartHeating,
+      child: Container(
+        width: 240,
+        height: 60,
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [MechanicalTheme.heatOrange, MechanicalTheme.heatRed],
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
+          ),
+          borderRadius: BorderRadius.circular(30),
+          boxShadow: MechanicalTheme.createGlowShadow(MechanicalTheme.heatOrange),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const Icon(
+              Icons.local_fire_department,
+              color: Colors.black,
+              size: 26,
+            ),
+            const SizedBox(width: 10),
+            const Text(
+              'START HEATING',
+              style: TextStyle(
+                color: Colors.black,
+                fontSize: 18,
+                fontWeight: FontWeight.w900,
+                letterSpacing: 1.5,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSetSideButton() {
+    return GestureDetector(
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (context) => const SetSidePage()),
+        );
+      },
+      child: Container(
+        width: 180,
+        height: 50,
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [MechanicalTheme.warningYellow, MechanicalTheme.warningRed],
+            begin: Alignment.centerLeft,
+            end: Alignment.centerRight,
+          ),
+          borderRadius: BorderRadius.circular(25),
+          boxShadow: MechanicalTheme.createGlowShadow(MechanicalTheme.warningYellow, intensity: 0.6),
+        ),
+        child: const Center(
+          child: Text(
+            'SET SIDE',
+            style: TextStyle(
+              color: Colors.black,
+              fontSize: 16,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 2,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 选择器环绘制器
+class _SelectorRingPainter extends CustomPainter {
+  final Color color;
+
+  _SelectorRingPainter({required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1;
+
+    final center = Offset(size.width / 2, size.height / 2);
+
+    // 绘制多个同心圆环
+    for (int i = 0; i < 3; i++) {
+      final radius = 70.0 + i * 25.0;
+      paint.strokeWidth = 1.5 - i * 0.3;
+      canvas.drawCircle(center, radius, paint);
+    }
+
+    // 绘制装饰点
+    paint.style = PaintingStyle.fill;
+    for (int i = 0; i < 12; i++) {
+      final angle = (2 * math.pi / 12) * i;
+      final x = center.dx + math.cos(angle) * 95;
+      final y = center.dy + math.sin(angle) * 95;
+      canvas.drawCircle(Offset(x, y), 2.5, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _SelectorRingPainter oldDelegate) {
+    return oldDelegate.color != color;
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/ws",
+      "destination": "http://43.138.237.99/api/ws"
+    },
+    {
+      "source": "/api/:path*",
+      "destination": "http://43.138.237.99/api/:path*"
+    },
+    {
+      "source": "/firmware/:path*",
+      "destination": "http://43.138.237.99/firmware/:path*"
+    }
+  ]
+}

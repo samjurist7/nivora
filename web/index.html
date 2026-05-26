@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="description"
+      content="A new Flutter project."
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nivora</title>
+    <script>
+      // ===== 调试面板 (iOS 上无法看 console，显示在页面上) =====
+      let _debugLogs = [];
+      function bleLog(msg) {
+        console.log(msg);
+        _debugLogs.push('[' + new Date().toLocaleTimeString() + '] ' + msg);
+        if (_debugLogs.length > 50) _debugLogs.shift();
+        const el = document.getElementById('ble-debug');
+        if (el) {
+          el.textContent = _debugLogs.join('\n');
+          el.scrollTop = el.scrollHeight;
+        }
+      }
+      // 只捕获 BLE 相关的错误，过滤掉 Flutter 引擎自身的空错误
+      window.addEventListener('error', (e) => {
+        if (e.message) bleLog('ERROR: ' + e.message + (e.filename ? ' @ ' + e.filename + ':' + e.lineno : ''));
+      });
+      window.addEventListener('unhandledrejection', (e) => {
+        const msg = e.reason ? (e.reason.message || e.reason.toString()) : '';
+        if (msg) bleLog('REJECT: ' + msg);
+      });
+
+      // 全局变量存储连接状态
+      let bleDevice = null;
+      let bleServer = null;
+      let bleService = null;
+      let notifyCharacteristic = null;
+      let writeCharacteristic = null;  // 专门缓存写入特征
+      // 按 UUID 缓存所有可写特征，避免 iOS 上枚举顺序不同导致写错特征
+      let writeCharacteristicsMap = {};
+      // 写入队列，防止 iOS BLE 流控丢包
+      let writeQueue = Promise.resolve();
+      // iOS 写入间隔 (ms)，防止数据包被丢弃 - iOS 需要更长的间隔
+      const WRITE_INTERVAL_MS = 100;  // 从 50ms 增加到 100ms，iOS 需要更保守的流控
+      // 检测是否为 iOS 设备
+      const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+      bleLog('Platform: ' + (isIOS ? 'iOS' : 'non-iOS') + ' | UA: ' + navigator.userAgent.substring(0, 80));
+
+      // 请求蓝牙设备
+      async function webRequestBluetooth() {
+        if (!navigator.bluetooth) {
+          return JSON.stringify({ error: 'web_bluetooth_not_supported' });
+        }
+        try {
+          const device = await navigator.bluetooth.requestDevice({
+            acceptAllDevices: true,
+            optionalServices: ['59462f12-9543-9999-12c8-58b459a2712d']
+          });
+          bleDevice = device;
+          return JSON.stringify({ name: device.name, id: device.id });
+        } catch (e) {
+          return JSON.stringify({ error: e.toString() });
+        }
+      }
+
+      // 连接设备
+      async function webConnectDevice() {
+        if (!bleDevice) {
+          return JSON.stringify({ error: 'no_device_selected' });
+        }
+        try {
+          bleLog('[connect] 正在连接 GATT...');
+          bleServer = await bleDevice.gatt.connect();
+          bleLog('[connect] GATT 连接成功');
+          bleDevice.addEventListener('gattserverdisconnected', () => {
+            bleServer = null;
+            bleService = null;
+            notifyCharacteristic = null;
+            writeCharacteristic = null;
+            writeCharacteristicsMap = {};
+            writeQueue = Promise.resolve();
+            if (window.onBleDisconnected) {
+              window.onBleDisconnected();
+            }
+          });
+          return JSON.stringify({ success: true });
+        } catch (e) {
+          return JSON.stringify({ error: e.toString() });
+        }
+      }
+
+      // 断开连接
+      async function webDisconnectDevice() {
+        try {
+          if (notifyCharacteristic) {
+            await notifyCharacteristic.stopNotifications();
+            notifyCharacteristic = null;
+          }
+          if (bleServer && bleServer.connected) {
+            bleServer.disconnect();
+          }
+          bleServer = null;
+          bleService = null;
+          writeCharacteristic = null;
+          writeCharacteristicsMap = {};
+          writeQueue = Promise.resolve();
+          return JSON.stringify({ success: true });
+        } catch (e) {
+          return JSON.stringify({ error: e.toString() });
+        }
+      }
+
+      // 发现服务 - 缓存所有特征到 Map 中，按 UUID 精确查找
+      async function webDiscoverServices(serviceUuid) {
+        if (!bleServer || !bleServer.connected) {
+          return JSON.stringify({ error: 'not_connected' });
+        }
+        try {
+          bleService = await bleServer.getPrimaryService(serviceUuid);
+
+          const characteristics = await bleService.getCharacteristics();
+          bleLog('[discover] 特征数量：' + characteristics.length);
+
+          writeCharacteristicsMap = {};
+          for (const char of characteristics) {
+            const props = char.properties;
+            // 统一转换为小写 UUID，避免 iOS/Android 格式不一致
+            const charUuidLower = char.uuid.toLowerCase();
+            bleLog('[discover] 特征：' + charUuidLower +
+              ' W:' + props.write +
+              ' WnR:' + props.writeWithoutResponse +
+              ' N:' + props.notify +
+              ' I:' + (props.indicate || false));
+
+            // 按 UUID 缓存所有可写特征（使用小写）
+            if (props.write || props.writeWithoutResponse) {
+              writeCharacteristicsMap[charUuidLower] = char;
+              bleLog('[discover] 缓存可写特征：' + charUuidLower);
+            }
+          }
+
+          const uuids = Object.keys(writeCharacteristicsMap);
+          bleLog('[discover] 可写特征总数：' + uuids.length + ' UUIDs: ' + uuids.join(', '));
+
+          // 优先选择第一个可写特征作为默认写入特征
+          if (uuids.length > 0) {
+            writeCharacteristic = writeCharacteristicsMap[uuids[0]];
+            bleLog('[discover] 默认写入特征：' + uuids[0]);
+          }
+
+          return JSON.stringify({ success: true, serviceUuid: serviceUuid });
+        } catch (e) {
+          return JSON.stringify({ error: e.toString() });
+        }
+      }
+
+      // 串行写入，防止 iOS BLE 流控丢包
+      let lastWriteTime = 0;  // 记录上次写入时间
+      function enqueueWrite(writeFn) {
+        writeQueue = writeQueue.then(async () => {
+          // iOS 额外保护：确保每次写入间隔至少 100ms
+          if (isIOS) {
+            const now = Date.now();
+            const elapsed = now - lastWriteTime;
+            if (elapsed < WRITE_INTERVAL_MS) {
+              const delay = WRITE_INTERVAL_MS - elapsed;
+              bleLog('[enqueueWrite] iOS 流控：等待 ' + delay + 'ms');
+              await new Promise(r => setTimeout(r, delay));
+            }
+            lastWriteTime = Date.now();
+          }
+          await writeFn();
+          // 写入后额外延迟，确保数据发送完成
+          if (isIOS) {
+            await new Promise(r => setTimeout(r, 50));
+          }
+        });
+        return writeQueue;
+      }
+
+      // 写入特征值
+      // 核心策略：收发是同一个UUID，直接复用已获取的 notifyCharacteristic 对象写入
+      // Bluefy 浏览器的 getCharacteristic() 二次调用会卡死，所以必须复用已有对象
+      async function webWriteCharacteristic(serviceUuid, charUuid, bytesJson) {
+        if (!bleServer || !bleServer.connected) {
+          return JSON.stringify({ error: 'not_connected' });
+        }
+        try {
+          const bytes = JSON.parse(bytesJson);
+          const data = new Uint8Array(bytes);
+          const cmdHex = bytes.length > 0 ? '0x' + bytes[0].toString(16).toUpperCase().padStart(2,'0') : '??';
+
+          bleLog('[write] cmd=' + cmdHex + ' len=' + bytes.length);
+
+          // 策略1: 直接用 notifyCharacteristic（收发同UUID，这个对象已经成功获取）
+          if (notifyCharacteristic) {
+            bleLog('[write] 使用notifyCharacteristic写入: ' + notifyCharacteristic.uuid);
+            await enqueueWrite(async () => {
+              await bleWrite(notifyCharacteristic, data);
+            });
+            bleLog('[write] OK');
+            return JSON.stringify({ success: true });
+          }
+
+          // 策略2: 用缓存的可写特征
+          const cachedUuids = Object.keys(writeCharacteristicsMap);
+          if (cachedUuids.length > 0) {
+            const char = writeCharacteristicsMap[cachedUuids[0]];
+            bleLog('[write] 使用缓存特征: ' + cachedUuids[0]);
+            await enqueueWrite(async () => {
+              await bleWrite(char, data);
+            });
+            bleLog('[write] OK');
+            return JSON.stringify({ success: true });
+          }
+
+          bleLog('[write] FAILED: 无可用特征对象');
+          return JSON.stringify({ error: 'no_characteristic_available' });
+        } catch (e) {
+          bleLog('[write] EXCEPTION: ' + e);
+          return JSON.stringify({ error: e.toString() });
+        }
+      }
+
+      // 实际写入，兼容不同浏览器API
+      // Bluefy 上 writeValueWithoutResponse 会"假成功"(本地OK但数据没到设备)
+      // 所以优先用 writeValue (旧版API，带响应，兼容性最好)
+      async function bleWrite(characteristic, data) {
+        const cmdHex = data.length > 0 ? '0x' + data[0].toString(16).toUpperCase().padStart(2,'0') : '??';
+        bleLog('[bleWrite] char=' + characteristic.uuid + ' cmd=' + cmdHex + ' bytes=' + data.length);
+
+        // 尝试1: writeValue (旧版API，默认带响应，Bluefy兼容性最好)
+        if (typeof characteristic.writeValue === 'function') {
+          try {
+            await characteristic.writeValue(data);
+            bleLog('[bleWrite] writeValue OK');
+            return;
+          } catch (e1) {
+            bleLog('[bleWrite] writeValue failed: ' + e1);
+          }
+        }
+
+        // 尝试2: writeValueWithResponse (新版API，带响应)
+        if (typeof characteristic.writeValueWithResponse === 'function') {
+          try {
+            await characteristic.writeValueWithResponse(data);
+            bleLog('[bleWrite] writeValueWithResponse OK');
+            return;
+          } catch (e2) {
+            bleLog('[bleWrite] writeValueWithResponse failed: ' + e2);
+          }
+        }
+
+        // 尝试3: writeValueWithoutResponse (最后手段，Bluefy上可能假成功)
+        if (typeof characteristic.writeValueWithoutResponse === 'function') {
+          try {
+            await characteristic.writeValueWithoutResponse(data);
+            bleLog('[bleWrite] writeValueWithoutResponse OK (可能假成功)');
+            return;
+          } catch (e3) {
+            bleLog('[bleWrite] writeValueWithoutResponse failed: ' + e3);
+          }
+        }
+
+        throw new Error('All write methods failed');
+      }
+
+      // (writeWithPreferResponse 已被 bleWrite 替代)
+
+      // 启用通知
+      async function webEnableNotifications(serviceUuid, charUuid) {
+        if (!bleServer || !bleServer.connected) {
+          return JSON.stringify({ error: 'not_connected' });
+        }
+        try {
+          let service = bleService;
+          if (!service || service.uuid !== serviceUuid) {
+            service = await bleServer.getPrimaryService(serviceUuid);
+            bleService = service;
+          }
+          bleLog('[notify] 获取通知特征：' + charUuid);
+          notifyCharacteristic = await service.getCharacteristic(charUuid);
+          bleLog('[notify] 启动通知...');
+          await notifyCharacteristic.startNotifications();
+          bleLog('[notify] 通知已启动');
+
+          // 使用具名函数，避免重复绑定
+          notifyCharacteristic._bleHandler = (event) => {
+            const value = event.target.value;
+            if (!value || value.byteLength === 0) return;
+            const bytes = [];
+            for (let i = 0; i < value.byteLength; i++) {
+              bytes.push(value.getUint8(i));
+            }
+            bleLog('[notify] 收到数据 len=' + bytes.length + ' [' + bytes.slice(0, 6).map(b => '0x' + b.toString(16).toUpperCase().padStart(2,'0')).join(',') + (bytes.length > 6 ? '...' : '') + ']');
+            if (window.onBleNotification) {
+              window.onBleNotification(JSON.stringify(bytes));
+            }
+          };
+          notifyCharacteristic.addEventListener(
+            'characteristicvaluechanged',
+            notifyCharacteristic._bleHandler
+          );
+
+          // iOS 关键修复：启用通知后，重新获取特征对象用于写入，避免冲突
+          bleLog('[notify] iOS 修复：重新获取特征用于写入...');
+          await new Promise(r => setTimeout(r, 300));  // 等待 300ms
+          const writeChar = await service.getCharacteristic(charUuid);
+          writeCharacteristic = writeChar;
+          bleLog('[notify] 写入特征已重新获取：' + writeChar.uuid);
+
+          return JSON.stringify({ success: true });
+        } catch (e) {
+          return JSON.stringify({ error: e.toString() });
+        }
+      }
+
+      // 禁用通知
+      async function webDisableNotifications() {
+        try {
+          if (notifyCharacteristic) {
+            if (notifyCharacteristic._bleHandler) {
+              notifyCharacteristic.removeEventListener(
+                'characteristicvaluechanged',
+                notifyCharacteristic._bleHandler
+              );
+            }
+            await notifyCharacteristic.stopNotifications();
+            notifyCharacteristic = null;
+          }
+          return JSON.stringify({ success: true });
+        } catch (e) {
+          return JSON.stringify({ error: e.toString() });
+        }
+      }
+
+      // 检查连接状态（不打日志，避免未连接时频繁刷屏）
+      function webIsConnected() {
+        return bleServer && bleServer.connected ? 'true' : 'false';
+      }
+    </script>
+  </head>
+  <body>
+    <!-- BLE 调试面板（已隐藏） -->
+    <div id="ble-debug-toggle" style="display:none;"></div>
+    <div id="ble-debug-panel" style="display:none;">
+      <div></div>
+      <pre id="ble-debug" style="color:#0f0;font-size:10px;max-height:200px;overflow-y:auto;margin:0;white-space:pre-wrap;word-break:break-all;"></pre>
+    </div>
+    <script src="main.dart.js" type="application/javascript"></script>
+  </body>
+</html>
