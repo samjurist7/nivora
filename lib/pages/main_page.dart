@@ -13,6 +13,7 @@ import 'cloud_devices_page.dart';
 import 'set_side_page.dart';
 import 'device_info_page.dart';
 import 'heating_page.dart';
+import 'session_dashboard_page.dart';
 
 /// Main page - Modern tech style (referencing VOLTA UI)
 class MainPage extends StatefulWidget {
@@ -82,7 +83,7 @@ class _MainPageState extends State<MainPage> {
       Navigator.push(
         context,
         MaterialPageRoute(
-          builder: (context) => HeatingPage(
+          builder: (context) => SessionDashboardPage(
             heatPreset: _selectedIndex,
             modeName: modeName,
           ),
